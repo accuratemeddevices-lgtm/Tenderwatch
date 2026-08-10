@@ -2,7 +2,8 @@ name: Parallel Tender Scraper
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Runs every day at midnight automatically
+    # 30 18 UTC = 12:01 AM IST
+    - cron: '30 18 * * *' 
   workflow_dispatch:    # Allows you to click a "Run Workflow" button manually
 
 jobs:
