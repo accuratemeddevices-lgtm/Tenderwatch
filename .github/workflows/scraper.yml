@@ -1,0 +1,40 @@
+name: Parallel Tender Scraper
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs every day at midnight automatically
+  workflow_dispatch:    # Allows you to click a "Run Workflow" button manually
+
+jobs:
+  scrape_workers:
+    runs-on: ubuntu-latest
+    
+    # THE MAGIC: This matrix spawns 3 completely separate VMs simultaneously
+    strategy:
+      matrix:
+        worker: [Worker_A, Worker_B, Worker_C]
+        
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright beautifulsoup4 psycopg2-binary requests
+          playwright install chromium
+          playwright install-deps
+
+      - name: Run Scraper Worker
+        env:
+          # Pulls securely from your GitHub repo settings
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          
+          # Assigns the matrix ID to the python script so we know who is working
+          WORKER_ID: ${{ matrix.worker }}
+        run: python scraper.py
