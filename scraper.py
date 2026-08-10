@@ -311,70 +311,85 @@ async def scrape_portal(portal, pg, conn):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            await pg.goto(listing_url, timeout=45000, wait_until="domcontentloaded")
+            await pg.goto(listing_url, timeout=60000, wait_until="domcontentloaded")
             break
         except Exception as e:
-            if attempt == max_retries - 1: return
+            if attempt == max_retries - 1: 
+                print(f"  ❌ Failed to load listing page: {e}")
+                return
             await asyncio.sleep(5)
 
     for org_idx in range(250):
-        try: await pg.wait_for_selector("text='Organisation Name'", timeout=15000)
-        except:
-            await pg.goto(listing_url, timeout=30000, wait_until="domcontentloaded")
-            await pg.wait_for_selector("text='Organisation Name'", timeout=15000)
-
-        link_handle = await pg.evaluate_handle(f'''(idx) => {{
-            const headerRow = Array.from(document.querySelectorAll("tr")).find(r => r.innerText.includes("Organisation Name"));
-            if (!headerRow) return null;
-            const dataRows = Array.from(headerRow.closest("table").querySelectorAll("tr")).filter(r => {{
-                const tds = r.querySelectorAll("td");
-                return tds.length >= 3 && tds[0].innerText.trim().match(/^\\d+\\.?$/);
-            }});
-            return idx < dataRows.length ? dataRows[idx].querySelectorAll("td")[dataRows[idx].querySelectorAll("td").length - 1].querySelector("a") : null;
-        }}''', org_idx)
-
         try:
-            async with pg.expect_navigation(timeout=30000): await link_handle.click()
-        except: continue
+            # Check if page is still alive before continuing
+            if pg.is_closed():
+                print("  ❌ Browser page was unexpectedly closed. Aborting this portal.")
+                return
 
-        await asyncio.sleep(2)
-        while True:
-            html = await pg.content()
-            tenders = parse_gepnic_page(html, pname, base_url)
-            if not tenders: break
+            try: await pg.wait_for_selector("text='Organisation Name'", timeout=15000)
+            except:
+                await pg.goto(listing_url, timeout=30000, wait_until="domcontentloaded")
+                await pg.wait_for_selector("text='Organisation Name'", timeout=15000)
 
-            existing_status = get_existing_tenders(conn, [t.get("tender_id","") for t in tenders])
-            needs_detail = [i for i, t in enumerate(tenders) if t.get("tender_id","") not in existing_status or not existing_status[t.get("tender_id","")]]
+            link_handle = await pg.evaluate_handle(f'''(idx) => {{
+                const headerRow = Array.from(document.querySelectorAll("tr")).find(r => r.innerText.includes("Organisation Name"));
+                if (!headerRow) return null;
+                const dataRows = Array.from(headerRow.closest("table").querySelectorAll("tr")).filter(r => {{
+                    const tds = r.querySelectorAll("td");
+                    return tds.length >= 3 && tds[0].innerText.trim().match(/^\\d+\\.?$/);
+                }});
+                return idx < dataRows.length ? dataRows[idx].querySelectorAll("td")[dataRows[idx].querySelectorAll("td").length - 1].querySelector("a") : null;
+            }}''', org_idx)
 
-            for idx, row_i in enumerate(needs_detail):
-                t = tenders[row_i]
-                extra = await scrape_one_detail(pg, t.get("detail_url",""), pg.url, t.get("tender_id",""))
-                if extra is None: break
-                if extra:
-                    t.update(extra)
-                    t["detail_scraped"] = True
-                else: t["detail_scraped"] = False
-                await asyncio.sleep(random.uniform(0.5, 1.0))
-
-            conn, ins, skp = save_tenders(tenders, conn)
-
-            nxt = await find_next_link(pg)
-            if not nxt: break
             try:
-                async with pg.expect_navigation(timeout=20000): await nxt.click()
-            except: break
+                async with pg.expect_navigation(timeout=30000): await link_handle.click()
+            except: continue
 
-        back_clicked = False
-        for sel in ["a:has-text('Back')", "input[value='Back']"]:
-            try:
-                btn = await pg.query_selector(sel)
-                if btn:
-                    async with pg.expect_navigation(timeout=10000): await btn.click()
-                    back_clicked = True
-                    break
-            except: pass
-        if not back_clicked: await pg.goto(listing_url, timeout=30000, wait_until="domcontentloaded")
-        await asyncio.sleep(1)
+            await asyncio.sleep(2)
+            while True:
+                if pg.is_closed(): return # Safety check
+                
+                html = await pg.content()
+                tenders = parse_gepnic_page(html, pname, base_url)
+                if not tenders: break
+
+                existing_status = get_existing_tenders(conn, [t.get("tender_id","") for t in tenders])
+                needs_detail = [i for i, t in enumerate(tenders) if t.get("tender_id","") not in existing_status or not existing_status[t.get("tender_id","")]]
+
+                for idx, row_i in enumerate(needs_detail):
+                    if pg.is_closed(): return # Safety check
+                    t = tenders[row_i]
+                    extra = await scrape_one_detail(pg, t.get("detail_url",""), pg.url, t.get("tender_id",""))
+                    if extra is None: break
+                    if extra:
+                        t.update(extra)
+                        t["detail_scraped"] = True
+                    else: t["detail_scraped"] = False
+                    await asyncio.sleep(random.uniform(0.5, 1.0))
+
+                conn, ins, skp = save_tenders(tenders, conn)
+
+                nxt = await find_next_link(pg)
+                if not nxt: break
+                try:
+                    async with pg.expect_navigation(timeout=20000): await nxt.click()
+                except: break
+
+            back_clicked = False
+            for sel in ["a:has-text('Back')", "input[value='Back']"]:
+                try:
+                    btn = await pg.query_selector(sel)
+                    if btn:
+                        async with pg.expect_navigation(timeout=10000): await btn.click()
+                        back_clicked = True
+                        break
+                except: pass
+            if not back_clicked: await pg.goto(listing_url, timeout=30000, wait_until="domcontentloaded")
+            await asyncio.sleep(1)
+            
+        except Exception as e:
+            print(f"  ⚠️ Recoverable error on org {org_idx}: {e}")
+            continue
 
 async def worker_loop():
     PORTALS = [
@@ -390,37 +405,51 @@ async def worker_loop():
     conn = get_conn()
     init_queue(conn, PORTALS)
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
-        ctx = await browser.new_context(viewport={"width":1280,"height":900})
-        pg = await ctx.new_page()
-
-        while True:
-            # 1. Fetch the next available portal from DB
-            portal_name = get_next_portal(conn)
+    while True:
+        # 1. Fetch the next available portal from DB
+        portal_name = get_next_portal(conn)
+        
+        # 2. If nothing is pending, this worker is done
+        if not portal_name:
+            print(f"🏁 WORKER {WORKER_ID}: No pending portals left in queue. Shutting down.")
+            break
             
-            # 2. If nothing is pending, this worker is done
-            if not portal_name:
-                print(f"🏁 WORKER {WORKER_ID}: No pending portals left in queue. Shutting down.")
-                break
+        # 3. Find the config
+        portal_config = next((p for p in PORTALS if p["name"] == portal_name), None)
+        if portal_config:
+            
+            # 🔥 THE FIX: Launch a FRESH browser for EVERY portal to prevent Memory/RAM crashes
+            try:
+                async with async_playwright() as pw:
+                    browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage", "--disable-gpu"])
+                    ctx = await browser.new_context(viewport={"width":1280,"height":900})
+                    pg = await ctx.new_page()
+                    
+                    # Scrape the portal
+                    await scrape_portal(portal_config, pg, conn)
+                    
+                    await browser.close()
                 
-            # 3. Find the config and process it
-            portal_config = next((p for p in PORTALS if p["name"] == portal_name), None)
-            if portal_config:
-                await scrape_portal(portal_config, pg, conn)
+                # Only mark completed if the browser didn't completely blow up
                 conn = mark_completed(conn, portal_name)
                 print(f"✅ WORKER {WORKER_ID}: Finished {portal_name}")
+                
+            except Exception as e:
+                print(f"❌ WORKER {WORKER_ID}: Fatal Browser Crash on {portal_name}: {e}")
+                # We skip mark_completed so it stays 'running' or we can manual reset it later.
+                # The worker survives and will pick up the next portal in the queue.
 
-        await browser.close()
-    
     # POST-PROCESSING: Only the last worker to finish should run this
+    conn = ensure_conn(conn)
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM scraping_queue WHERE status != 'completed'")
     if cur.fetchone()[0] == 0:
         cur.execute("UPDATE scraping_queue SET status = 'post_processing' WHERE portal_name = %s", (PORTALS[0]['name'],))
         if cur.rowcount > 0: # Ensure we acquired the lock to process
+            print("🚀 ALL WORKERS DONE. Starting Post-Processing...")
             mark_expired_tenders(conn)
-            run_pincode_mapping(conn)
+            run_pincode_mapping(conn, batch_size=1000)
+    cur.close()
     conn.close()
 
 if __name__ == "__main__":
