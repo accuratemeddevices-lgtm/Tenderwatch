@@ -12,6 +12,7 @@ jobs:
     
     # THE MAGIC: This matrix spawns 3 completely separate VMs simultaneously
     strategy:
+    fail-fast: false  # ADD THIS LINE
       matrix:
         worker: [Worker_A, Worker_B, Worker_C]
         
