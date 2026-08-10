@@ -76,11 +76,13 @@ def get_next_portal(conn):
     return row[0] if row else None
 
 def mark_completed(conn, portal_name):
+    conn = ensure_conn(conn) # Wakes up dead connections
     cur = conn.cursor()
     cur.execute("UPDATE scraping_queue SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE portal_name = %s", (portal_name,))
     conn.commit()
     cur.close()
-
+    return conn
+    
 # ── CORE SCRAPING FUNCTIONS (From Your Code) ───────────────────
 def get_existing_tenders(conn, tender_ids):
     if not tender_ids: return {}
@@ -406,7 +408,7 @@ async def worker_loop():
             portal_config = next((p for p in PORTALS if p["name"] == portal_name), None)
             if portal_config:
                 await scrape_portal(portal_config, pg, conn)
-                mark_completed(conn, portal_name)
+                conn = mark_completed(conn, portal_name)
                 print(f"✅ WORKER {WORKER_ID}: Finished {portal_name}")
 
         await browser.close()
