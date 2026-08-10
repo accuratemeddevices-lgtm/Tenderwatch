@@ -1,5 +1,5 @@
 # ============================================================
-# TENDERWATCH SCRAPER - PARALLEL WORKER ENGINE
+# TENDERWATCH SCRAPER - STATIC WORKER ASSIGNMENT ENGINE
 # ============================================================
 
 import os, asyncio, random, re, hashlib, time
@@ -12,7 +12,7 @@ from psycopg2.extras import execute_values
 
 # ── DATABASE CONFIGURATION ──────────────────────────────────────
 NEON_URL = os.environ.get("NEON_DATABASE_URL")
-WORKER_ID = os.environ.get("WORKER_ID", "local-worker")
+WORKER_ID = os.environ.get("WORKER_ID", "Worker_A") # Default to A if running locally
 
 if not NEON_URL:
     raise ValueError("CRITICAL: NEON_DATABASE_URL not found in environment variables!")
@@ -31,59 +31,7 @@ def ensure_conn(conn):
         except: pass
         return get_conn()
 
-# ── PARALLEL QUEUE MANAGEMENT ──────────────────────────────────
-def init_queue(conn, portals):
-    """Creates the queue and resets it daily so workers can start fresh."""
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS scraping_queue (
-            portal_name TEXT PRIMARY KEY,
-            status TEXT DEFAULT 'pending',
-            worker_id TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    for p in portals:
-        # Insert portals, or reset them to pending if they haven't been touched in 12 hours
-        cur.execute("""
-            INSERT INTO scraping_queue (portal_name, status, updated_at)
-            VALUES (%s, 'pending', CURRENT_TIMESTAMP)
-            ON CONFLICT (portal_name) DO UPDATE SET
-                status = CASE WHEN scraping_queue.updated_at < CURRENT_TIMESTAMP - INTERVAL '12 hours' THEN 'pending' ELSE scraping_queue.status END,
-                updated_at = CASE WHEN scraping_queue.updated_at < CURRENT_TIMESTAMP - INTERVAL '12 hours' THEN CURRENT_TIMESTAMP ELSE scraping_queue.updated_at END;
-        """, (p['name'],))
-    conn.commit()
-    cur.close()
-
-def get_next_portal(conn):
-    """Atomically fetches and locks the next pending portal for this specific worker."""
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE scraping_queue
-        SET status = 'running', worker_id = %s, updated_at = CURRENT_TIMESTAMP
-        WHERE portal_name = (
-            SELECT portal_name FROM scraping_queue
-            WHERE status = 'pending'
-            ORDER BY portal_name
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-        )
-        RETURNING portal_name;
-    """, (WORKER_ID,))
-    row = cur.fetchone()
-    conn.commit()
-    cur.close()
-    return row[0] if row else None
-
-def mark_completed(conn, portal_name):
-    conn = ensure_conn(conn) # Wakes up dead connections
-    cur = conn.cursor()
-    cur.execute("UPDATE scraping_queue SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE portal_name = %s", (portal_name,))
-    conn.commit()
-    cur.close()
-    return conn
-    
-# ── CORE SCRAPING FUNCTIONS (From Your Code) ───────────────────
+# ── CORE SCRAPING FUNCTIONS ─────────────────────────────────────
 def get_existing_tenders(conn, tender_ids):
     if not tender_ids: return {}
     conn = ensure_conn(conn)
@@ -154,7 +102,6 @@ def save_tenders(tenders, conn):
     return conn, ins, len(rows) - ins
 
 
-# (Include your exact parse_gepnic_page, parse_gepnic_detail, find_next_link, scrape_one_detail, mark_expired_tenders, and run_pincode_mapping functions here unchanged)
 def parse_gepnic_page(html, pname, base_url):
     soup = BeautifulSoup(html, "html.parser")
     tenders = []
@@ -292,15 +239,87 @@ async def scrape_one_detail(pg, detail_url, listing_url, listing_tender_id=""):
         except: pass
         return {}
 
+
+# ── POST-PROCESSING ─────────────────────────────────────────────
 def run_pincode_mapping(conn, batch_size=1000):
-    print("  📍 Post-Processing: Pincode mapping...")
-    # Add your existing logic here...
+    print("  📍 Pincode → District/State mapping...")
+    conn = ensure_conn(conn)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT tender_id, pincode FROM tenders_data
+        WHERE pincode IS NOT NULL AND pincode != '' AND LENGTH(TRIM(pincode)) = 6
+          AND (district IS NULL OR district = '' OR state IS NULL OR state = '')
+        LIMIT %s
+    """, (batch_size,))
+    rows = cur.fetchall()
+    cur.close()
+    
+    if not rows:
+        print("      ✅ Nothing to resolve")
+        return conn
+
+    resolved, failed = 0, 0
+    unique_pincodes = {}
+    for tender_id, pincode in rows:
+        pc = str(pincode).strip()
+        unique_pincodes.setdefault(pc, []).append(tender_id)
+
+    print(f"      {len(unique_pincodes)} unique pincodes to look up...")
+    
+    for pincode, tender_ids in unique_pincodes.items():
+        info = {}
+        for attempt in range(3):
+            try:
+                r = req_lib.get(f"https://api.postalpincode.in/pincode/{pincode}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                if r.status_code == 200:
+                    data = r.json()
+                    if data and data[0].get("Status") == "Success":
+                        po_list = data[0].get("PostOffice", [])
+                        if po_list:
+                            po = po_list[0]
+                            info = {
+                                "district": po.get("District",""),
+                                "state":    po.get("State",""),
+                                "city":     po.get("Division") or po.get("Block") or po.get("Name",""),
+                            }
+                    break
+            except Exception: time.sleep(1); continue
+
+        if info and info.get("district"):
+            conn = ensure_conn(conn)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE tenders_data SET city=%s, district=%s, state=%s WHERE tender_id = ANY(%s)
+            """, (info["city"], info["district"], info["state"], tender_ids))
+            conn.commit()
+            cur.close()
+            resolved += len(tender_ids)
+        else: failed += len(tender_ids)
+        time.sleep(0.3)
+        
+    print(f"      ✅ Resolved {resolved} | Failed {failed}")
     return conn
 
 def mark_expired_tenders(conn):
-    print("  ⏰ Post-Processing: Marking expired tenders...")
-    # Add your existing logic here...
-    return 0
+    print("  ⏰ Marking expired tenders...")
+    conn = ensure_conn(conn)
+    cur = conn.cursor()
+    cur.execute(r"""
+        UPDATE tenders_data SET status = 'closed'
+        WHERE status = 'active'
+          AND closing_date IS NOT NULL AND closing_date NOT IN ('NA','','N/A','Nil')
+          AND closing_date ~ '^[0-9]{2}-[A-Za-z]{3}-[0-9]{4}'
+          AND TO_TIMESTAMP(
+                SPLIT_PART(closing_date,' ',1) || ' ' || SPLIT_PART(closing_date,' ',2) || ' ' || SPLIT_PART(closing_date,' ',3),
+                'DD-Mon-YYYY HH12:MI AM'
+              ) < NOW()
+    """)
+    updated = cur.rowcount
+    conn.commit()
+    cur.close()
+    print(f"      ✅ Marked {updated} tenders as closed")
+    return updated
+
 
 # ── WORKER EXECUTION LOOP ──────────────────────────────────────
 async def scrape_portal(portal, pg, conn):
@@ -321,9 +340,8 @@ async def scrape_portal(portal, pg, conn):
 
     for org_idx in range(250):
         try:
-            # Check if page is still alive before continuing
             if pg.is_closed():
-                print("  ❌ Browser page was unexpectedly closed. Aborting this portal.")
+                print("  ❌ Browser page closed. Aborting portal.")
                 return
 
             try: await pg.wait_for_selector("text='Organisation Name'", timeout=15000)
@@ -347,7 +365,7 @@ async def scrape_portal(portal, pg, conn):
 
             await asyncio.sleep(2)
             while True:
-                if pg.is_closed(): return # Safety check
+                if pg.is_closed(): return
                 
                 html = await pg.content()
                 tenders = parse_gepnic_page(html, pname, base_url)
@@ -357,7 +375,7 @@ async def scrape_portal(portal, pg, conn):
                 needs_detail = [i for i, t in enumerate(tenders) if t.get("tender_id","") not in existing_status or not existing_status[t.get("tender_id","")]]
 
                 for idx, row_i in enumerate(needs_detail):
-                    if pg.is_closed(): return # Safety check
+                    if pg.is_closed(): return
                     t = tenders[row_i]
                     extra = await scrape_one_detail(pg, t.get("detail_url",""), pg.url, t.get("tender_id",""))
                     if extra is None: break
@@ -391,65 +409,50 @@ async def scrape_portal(portal, pg, conn):
             print(f"  ⚠️ Recoverable error on org {org_idx}: {e}")
             continue
 
+
 async def worker_loop():
-    PORTALS = [
+    ALL_PORTALS = [
         {"name": "CPPP (eprocure.gov.in)", "base_url": "https://eprocure.gov.in", "listing_url": "https://eprocure.gov.in/eprocure/app?page=FrontEndTendersByOrganisation&service=page"},
         {"name": "eTenders", "base_url": "https://etenders.gov.in", "listing_url": "https://etenders.gov.in/eprocure/app?page=FrontEndTendersByOrganisation&service=page"},
         {"name": "NTPC", "base_url": "https://eprocurentpc.nic.in", "listing_url": "https://eprocurentpc.nic.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"},
         {"name": "BHEL", "base_url": "https://eprocurebhel.co.in", "listing_url": "https://eprocurebhel.co.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"},
         {"name": "Coal India", "base_url": "https://coalindiatenders.nic.in", "listing_url": "https://coalindiatenders.nic.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"},
         {"name": "Daman & Diu", "base_url": "https://ddtenders.gov.in", "listing_url": "https://ddtenders.gov.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"},
-        {"name": "Dadra & NH", "base_url": "https://dnhtenders.gov.in", "listing_url": "https://dnhtenders.gov.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"}
+        {"name": "Dadra & NH", "base_url": "https://dnhtenders.gov.in", "listing_url": "https://dnhtenders.gov.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"},
+        {"name": "CPWD", "base_url": "https://etender.cpwd.gov.in", "listing_url": "https://etender.cpwd.gov.in/eprocure/app?page=FrontEndTendersByOrganisation&service=page"}
     ]
 
+    # STATIC ROUTING BASED ON GITHUB ACTIONS WORKER_ID
+    if WORKER_ID == "Worker_A":
+        my_portals = [p for p in ALL_PORTALS if p['name'] == "CPPP (eprocure.gov.in)"]
+    elif WORKER_ID == "Worker_B":
+        my_portals = [p for p in ALL_PORTALS if p['name'] == "eTenders"]
+    else: # Worker_C
+        my_portals = [p for p in ALL_PORTALS if p['name'] not in ["CPPP (eprocure.gov.in)", "eTenders"]]
+
     conn = get_conn()
-    init_queue(conn, PORTALS)
 
-    while True:
-        # 1. Fetch the next available portal from DB
-        portal_name = get_next_portal(conn)
-        
-        # 2. If nothing is pending, this worker is done
-        if not portal_name:
-            print(f"🏁 WORKER {WORKER_ID}: No pending portals left in queue. Shutting down.")
-            break
-            
-        # 3. Find the config
-        portal_config = next((p for p in PORTALS if p["name"] == portal_name), None)
-        if portal_config:
-            
-            # 🔥 THE FIX: Launch a FRESH browser for EVERY portal to prevent Memory/RAM crashes
-            try:
-                async with async_playwright() as pw:
-                    browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage", "--disable-gpu"])
-                    ctx = await browser.new_context(viewport={"width":1280,"height":900})
-                    pg = await ctx.new_page()
-                    
-                    # Scrape the portal
-                    await scrape_portal(portal_config, pg, conn)
-                    
-                    await browser.close()
+    for portal_config in my_portals:
+        # Launch a FRESH browser for EVERY portal to prevent Memory/RAM crashes
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage", "--disable-gpu"])
+                ctx = await browser.new_context(viewport={"width":1280,"height":900})
+                pg = await ctx.new_page()
                 
-                # Only mark completed if the browser didn't completely blow up
-                conn = mark_completed(conn, portal_name)
-                print(f"✅ WORKER {WORKER_ID}: Finished {portal_name}")
-                
-            except Exception as e:
-                print(f"❌ WORKER {WORKER_ID}: Fatal Browser Crash on {portal_name}: {e}")
-                # We skip mark_completed so it stays 'running' or we can manual reset it later.
-                # The worker survives and will pick up the next portal in the queue.
+                await scrape_portal(portal_config, pg, conn)
+                await browser.close()
+            print(f"✅ WORKER {WORKER_ID}: Finished {portal_config['name']}")
+        except Exception as e:
+            print(f"❌ WORKER {WORKER_ID}: Fatal Browser Crash on {portal_config['name']}: {e}")
 
-    # POST-PROCESSING: Only the last worker to finish should run this
-    conn = ensure_conn(conn)
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM scraping_queue WHERE status != 'completed'")
-    if cur.fetchone()[0] == 0:
-        cur.execute("UPDATE scraping_queue SET status = 'post_processing' WHERE portal_name = %s", (PORTALS[0]['name'],))
-        if cur.rowcount > 0: # Ensure we acquired the lock to process
-            print("🚀 ALL WORKERS DONE. Starting Post-Processing...")
-            mark_expired_tenders(conn)
-            run_pincode_mapping(conn, batch_size=1000)
-    cur.close()
+    # POST-PROCESSING: Worker_A is usually fastest, so we assign it the cleanup task.
+    if WORKER_ID == "Worker_A":
+        print("🚀 RUNNING POST-PROCESSING (Worker A)...")
+        conn = ensure_conn(conn)
+        mark_expired_tenders(conn)
+        run_pincode_mapping(conn, batch_size=1000)
+
     conn.close()
 
 if __name__ == "__main__":
