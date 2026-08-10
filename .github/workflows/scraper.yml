@@ -2,8 +2,7 @@ name: Parallel Tender Scraper
 
 on:
   schedule:
-    # 30 18 UTC = 12:01 AM IST
-    - cron: '30 18 * * *' 
+    - cron: '30 18 * * *' # Runs every day at midnight automatically
   workflow_dispatch:    # Allows you to click a "Run Workflow" button manually
 
 jobs:
@@ -12,7 +11,7 @@ jobs:
     
     # THE MAGIC: This matrix spawns 3 completely separate VMs simultaneously
     strategy:
-    fail-fast: false  # ADD THIS LINE
+      fail-fast: false  # ADD THIS LINE
       matrix:
         worker: [Worker_A, Worker_B, Worker_C]
         
