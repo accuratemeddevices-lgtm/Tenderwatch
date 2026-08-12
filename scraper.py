@@ -121,7 +121,8 @@ def parse_gepnic_page(html, pname, base_url):
                 if lnk and lnk.get("href"):
                     h = lnk["href"]
                     if "DirectLink" in h or "direct" in h.lower():
-                        detail_url = base_url + h if h.startswith("/") else h
+                        # Replace the old detail_url assignment with this:
+                        detail_url = h if h.startswith("http") else (base_url + h if h.startswith("/") else base_url + "/" + h)
                         title_cell = cols[ci]
                         break
             if not title_cell:
@@ -129,7 +130,7 @@ def parse_gepnic_page(html, pname, base_url):
                 lnk = title_cell.find("a")
                 if lnk and lnk.get("href"):
                     h = lnk["href"]
-                    detail_url = base_url + h if h.startswith("/") else h
+                    detail_url = h if h.startswith("http") else (base_url + h if h.startswith("/") else base_url + "/" + h)
 
             title = title_cell.get_text(separator=" ", strip=True) if title_cell else ""
             tid = (re.findall(r'\[([^\]]+)\]', title) or [""])[-1].strip()
@@ -419,17 +420,19 @@ async def worker_loop():
         {"name": "Coal India", "base_url": "https://coalindiatenders.nic.in", "listing_url": "https://coalindiatenders.nic.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"},
         {"name": "Daman & Diu", "base_url": "https://ddtenders.gov.in", "listing_url": "https://ddtenders.gov.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"},
         {"name": "Dadra & NH", "base_url": "https://dnhtenders.gov.in", "listing_url": "https://dnhtenders.gov.in/nicgep/app?page=FrontEndTendersByOrganisation&service=page"},
-        {"name": "CPWD", "base_url": "https://etender.cpwd.gov.in", "listing_url": "https://etender.cpwd.gov.in/eprocure/app?page=FrontEndTendersByOrganisation&service=page"}
     ]
 
-    # STATIC ROUTING BASED ON GITHUB ACTIONS WORKER_ID
+    # STATIC ROUTING FOR LOAD BALANCING
     if WORKER_ID == "Worker_A":
-        my_portals = [p for p in ALL_PORTALS if p['name'] == "CPPP (eprocure.gov.in)"]
+        # Heavy: CPPP | Light: Daman & Diu, Dadra & NH
+        my_portals = [p for p in ALL_PORTALS if p['name'] in ["CPPP (eprocure.gov.in)", "BHEL"]]
     elif WORKER_ID == "Worker_B":
-        my_portals = [p for p in ALL_PORTALS if p['name'] == "eTenders"]
+        # Heavy: eTenders | Light: NTPC, BHEL
+        my_portals = [p for p in ALL_PORTALS if p['name'] in ["eTenders", "Daman & Diu", "Dadra & NH"]]
     else: # Worker_C
-        my_portals = [p for p in ALL_PORTALS if p['name'] not in ["CPPP (eprocure.gov.in)", "eTenders"]]
-
+        # Heavy: CPWD | Light: Coal India
+        my_portals = [p for p in ALL_PORTALS if p['name'] in ["NTPC", "Coal India"]]
+    
     conn = get_conn()
 
     for portal_config in my_portals:
