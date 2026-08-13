@@ -421,13 +421,13 @@ async def worker_loop():
     # STATIC ROUTING FOR LOAD BALANCING
     if WORKER_ID == "Worker_A":
         # Heavy: CPPP | Light: Daman & Diu, Dadra & NH
-        my_portals = [p for p in ALL_PORTALS if p['name'] in ["CPPP (eprocure.gov.in)", "BHEL"]]
+        my_portals = [p for p in ALL_PORTALS if p['name'] in ["CPPP (eprocure.gov.in)"]]
     elif WORKER_ID == "Worker_B":
         # Heavy: eTenders | Light: NTPC, BHEL
         my_portals = [p for p in ALL_PORTALS if p['name'] in ["eTenders", "Daman & Diu", "Dadra & NH"]]
     else: # Worker_C
         # Heavy: CPWD | Light: Coal India
-        my_portals = [p for p in ALL_PORTALS if p['name'] in ["NTPC", "Coal India"]]
+        my_portals = [p for p in ALL_PORTALS if p['name'] in ["NTPC", "Coal India", "BHEL"]]
     
     conn = get_conn()
 
