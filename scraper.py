@@ -242,10 +242,21 @@ async def scrape_one_detail(pg, detail_url, listing_url, listing_tender_id=""):
 
 
 # ── POST-PROCESSING ─────────────────────────────────────────────
-def run_pincode_mapping(conn, batch_size=1000):
-    print("  📍 Pincode → District/State mapping...")
+import json
+
+def run_pincode_mapping(conn, batch_size=5000):
+    print("  📍 Post-Processing: Pincode → District/State mapping (Local Mode)...")
+    
+    try:
+        with open("pincodes.json", "r") as f:
+            pincode_map = json.load(f)
+    except FileNotFoundError:
+        print("      ⚠️ pincodes.json not found in repository! Skipping mapping.")
+        return conn
+
     conn = ensure_conn(conn)
     cur = conn.cursor()
+    
     cur.execute("""
         SELECT tender_id, pincode FROM tenders_data
         WHERE pincode IS NOT NULL AND pincode != '' AND LENGTH(TRIM(pincode)) = 6
@@ -253,52 +264,37 @@ def run_pincode_mapping(conn, batch_size=1000):
         LIMIT %s
     """, (batch_size,))
     rows = cur.fetchall()
-    cur.close()
     
     if not rows:
         print("      ✅ Nothing to resolve")
+        cur.close()
         return conn
 
     resolved, failed = 0, 0
-    unique_pincodes = {}
+    updates = []
+
     for tender_id, pincode in rows:
         pc = str(pincode).strip()
-        unique_pincodes.setdefault(pc, []).append(tender_id)
+        if pc in pincode_map:
+            info = pincode_map[pc]
+            # Appending only district, state, and tender_id
+            updates.append((info.get("district", ""), info.get("state", ""), tender_id))
+            resolved += 1
+        else:
+            failed += 1
 
-    print(f"      {len(unique_pincodes)} unique pincodes to look up...")
-    
-    for pincode, tender_ids in unique_pincodes.items():
-        info = {}
-        for attempt in range(3):
-            try:
-                r = req_lib.get(f"https://api.postalpincode.in/pincode/{pincode}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-                if r.status_code == 200:
-                    data = r.json()
-                    if data and data[0].get("Status") == "Success":
-                        po_list = data[0].get("PostOffice", [])
-                        if po_list:
-                            po = po_list[0]
-                            info = {
-                                "district": po.get("District",""),
-                                "state":    po.get("State",""),
-                                "city":     po.get("Division") or po.get("Block") or po.get("Name",""),
-                            }
-                    break
-            except Exception: time.sleep(1); continue
-
-        if info and info.get("district"):
-            conn = ensure_conn(conn)
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE tenders_data SET city=%s, district=%s, state=%s WHERE tender_id = ANY(%s)
-            """, (info["city"], info["district"], info["state"], tender_ids))
-            conn.commit()
-            cur.close()
-            resolved += len(tender_ids)
-        else: failed += len(tender_ids)
-        time.sleep(0.3)
+    if updates:
+        from psycopg2.extras import execute_values
+        execute_values(cur, """
+            UPDATE tenders_data 
+            SET district = data.district, state = data.state 
+            FROM (VALUES %s) AS data (district, state, tender_id) 
+            WHERE tenders_data.tender_id = data.tender_id
+        """, updates)
+        conn.commit()
         
-    print(f"      ✅ Resolved {resolved} | Failed {failed}")
+    cur.close()
+    print(f"      ✅ Resolved {resolved} | ❌ Failed {failed} (Invalid/Unknown Pincodes)")
     return conn
 
 def mark_expired_tenders(conn):
